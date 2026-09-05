@@ -28,9 +28,10 @@
 FROM ubuntu:22.04 AS rust-build
 
 ARG VLLM_VERSION=v0.26.0
+ARG BUILD_JOBS=24
 
 ENV DEBIAN_FRONTEND=noninteractive \
-    CARGO_BUILD_JOBS=4
+    CARGO_BUILD_JOBS=${BUILD_JOBS}
 
 RUN apt-get update -y && \
     apt-get install -y --no-install-recommends \
@@ -58,6 +59,8 @@ ARG http_proxy
 ARG https_proxy
 ARG no_proxy
 ARG VLLM_VERSION=v0.26.0
+ARG BUILD_JOBS=24
+ARG SYCL_BUILD_JOBS=8
 # vllm-xpu-kernels pinned base commit (aligned with Dockerfile.dev).
 ARG VLLM_XPU_KERNELS_COMMIT=a6929869587fa6c40dbe393eedc96eeab076bfbb
 
@@ -74,7 +77,9 @@ ENV VIRTUAL_ENV=/opt/buildenv \
     UV_INDEX_STRATEGY="unsafe-best-match" \
     UV_LINK_MODE="copy" \
     VLLM_TARGET_DEVICE=xpu \
-    WHEELS=/wheels
+    WHEELS=/wheels \
+    MAX_JOBS=${BUILD_JOBS} \
+    CMAKE_BUILD_PARALLEL_LEVEL=${BUILD_JOBS}
 
 # Required: build RUN steps use `source .../setvars.sh` and `set -eo pipefail`,
 # both bash-only (unavailable under the default /bin/sh).
@@ -159,7 +164,7 @@ RUN --mount=type=cache,target=/root/.cache/uv \
     set -eo pipefail && \
     source /opt/intel/oneapi/setvars.sh --force && \
     cd /src/custom-esimd-kernels-vllm && \
-    TORCH_XPU_ARCH_LIST="${XPU_ARCH}" MAX_JOBS=1 python3 setup.py bdist_wheel && \
+    TORCH_XPU_ARCH_LIST="${XPU_ARCH}" MAX_JOBS="${SYCL_BUILD_JOBS}" python3 setup.py bdist_wheel && \
     cp dist/*.whl ${WHEELS}/ && \
     rm -rf build dist
 
