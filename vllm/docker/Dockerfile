@@ -61,6 +61,11 @@ ARG VLLM_VERSION=v0.26.0
 # vllm-xpu-kernels pinned base commit (aligned with Dockerfile.dev).
 ARG VLLM_XPU_KERNELS_COMMIT=a6929869587fa6c40dbe393eedc96eeab076bfbb
 
+# First AutoRound commit containing the optimized B70/G31 INT8 implementation.
+ARG AUTOROUND_COMMIT=2ea60e555569c678908f316c994a9859a282e2e7
+ARG XPU_ARCH=bmg-g31
+ARG ARK_SYCL_TARGET=intel_gpu_bmg_g31
+
 ENV VIRTUAL_ENV=/opt/buildenv \
     PATH="/root/.local/bin:/opt/buildenv/bin:${PATH}" \
     UV_HTTP_TIMEOUT=500 \
@@ -75,7 +80,7 @@ ENV VIRTUAL_ENV=/opt/buildenv \
 # both bash-only (unavailable under the default /bin/sh).
 SHELL ["bash", "-c"]
 
-COPY ./patches/vllm_for_multi_arc.patch ./patches/vllm_xpu_kernels.patch /tmp/
+COPY ./patches/vllm_for_multi_arc.patch ./patches/vllm_xpu_kernels.patch ./patches/mamba-utils.patch /tmp/
 COPY ./custom-esimd-kernels-vllm /src/custom-esimd-kernels-vllm
 
 # --- build tooling (the oneAPI DPC++ compiler is already in the OMIX devel base) ---
@@ -103,6 +108,27 @@ RUN --mount=type=cache,target=/root/.cache/uv \
 RUN mkdir -p ${WHEELS}
 
 # ---------------------------------------------------------------------------
+# AutoRound ARK: build B70/G31 weight-only quantization kernels
+# ---------------------------------------------------------------------------
+RUN git clone https://github.com/intel/auto-round.git /src/auto-round && \
+  cd /src/auto-round && \
+  git checkout "${AUTOROUND_COMMIT}"
+
+# AutoRound declares torch>=2.13 at this commit, but llm-scaler is deliberately
+# built against torch 2.12.0+xpu. Build without dependency resolution so pip
+# does not replace the image's pinned PyTorch installation.
+RUN --mount=type=cache,target=/root/.cache/pip \
+  set -eo pipefail && \
+  source /opt/intel/oneapi/setvars.sh --force && \
+  pip install py-cpuinfo && \
+  cd /src/auto-round/auto_round_extension/ark && \
+  ARK_SYCL_TARGET="${ARK_SYCL_TARGET}" \
+  ARK_SYCL_TLA=ON \
+  ARK_SYCL_TLA_JOBS=1 \
+  python setup.py bdist_wheel && \
+  cp dist/auto_round_lib-*.whl "${WHEELS}/"
+
+# ---------------------------------------------------------------------------
 # 2a. vLLM v0.26.0 + multi-arc patch  ->  wheel
 # ---------------------------------------------------------------------------
 RUN --mount=type=cache,target=/root/.cache/uv \
@@ -111,6 +137,7 @@ RUN --mount=type=cache,target=/root/.cache/uv \
     git clone --depth 1 -b "${VLLM_VERSION}" https://github.com/vllm-project/vllm.git /src/vllm && \
     cd /src/vllm && \
     git apply /tmp/vllm_for_multi_arc.patch && \
+    git apply /tmp/mamba-utils.patch && \
     uv pip install -r requirements/xpu.txt && \
     uv pip install grpcio-tools protobuf nanobind
 
@@ -126,13 +153,13 @@ RUN --mount=type=cache,target=/root/.cache/uv \
     rm -rf build
 
 # ---------------------------------------------------------------------------
-# 2b. custom ESIMD kernels  ->  wheel  (TORCH_XPU_ARCH_LIST=bmg-g21)
+# 2b. custom ESIMD kernels  ->  wheel  (TORCH_XPU_ARCH_LIST=bmg-g31 by default)
 # ---------------------------------------------------------------------------
 RUN --mount=type=cache,target=/root/.cache/uv \
     set -eo pipefail && \
     source /opt/intel/oneapi/setvars.sh --force && \
     cd /src/custom-esimd-kernels-vllm && \
-    TORCH_XPU_ARCH_LIST=bmg-g21 MAX_JOBS=1 python3 setup.py bdist_wheel && \
+    TORCH_XPU_ARCH_LIST="${XPU_ARCH}" MAX_JOBS=1 python3 setup.py bdist_wheel && \
     cp dist/*.whl ${WHEELS}/ && \
     rm -rf build dist
 
@@ -200,6 +227,7 @@ RUN --mount=type=cache,target=/var/cache/apt,sharing=locked \
 COPY --from=builder /src/vllm ./vllm
 COPY --from=builder /src/vllm-xpu-kernels ./vllm-xpu-kernels
 COPY --from=builder /src/custom-esimd-kernels-vllm ./custom-esimd-kernels-vllm
+COPY --from=builder /src/auto-round ./auto-round
 
 # --- thin runtime OS deps, vLLM + kernel wheels, lean-core serving deps, and the
 #     triton-xpu fix/shrink all in ONE layer: cleanup must happen in the same RUN
@@ -240,9 +268,8 @@ RUN --mount=type=bind,from=builder,source=/wheels,target=/wheels \
     find /opt/intel/oneapi/ccl -mindepth 1 -maxdepth 1 -type d -not -name 2021.15 -exec rm -rf {} + && \
     rm -rf "/tmp/${ONECCL_INSTALLER%.sh}" /tmp/oneccl-runtime && \
     pip install /wheels/vllm-*.whl --extra-index-url https://download.pytorch.org/whl/xpu && \
-    pip install --no-deps --force-reinstall \
-        /wheels/custom_esimd_kernels_vllm-*.whl \
-        /wheels/vllm_xpu_kernels-*.whl && \
+    pip install --no-deps --force-reinstall /wheels/auto_round_lib-*.whl && \
+    pip install --no-deps --force-reinstall /wheels/custom_esimd_kernels_vllm-*.whl /wheels/vllm_xpu_kernels-*.whl && \
     pip install transformers==5.8.0 accelerate hf_transfer 'modelscope!=1.15.0' && \
     pip install librosa soundfile decord ijson && \
     pip install bigdl-core==2.4.0b2 && \
